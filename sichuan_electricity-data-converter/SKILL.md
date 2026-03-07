@@ -25,9 +25,35 @@ const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 
-// Configuration
+// 获取命令行参数 (例如: node script.js --interval=15)
+const args = process.argv.slice(2);
+const intervalArg = args.find(arg => arg.startsWith('--interval='));
+// 默认间隔为 60 分钟 (1小时)
+const interval = intervalArg ? intervalArg.split('=')[1] : '60'; 
+const is15Min = interval === '15';
+
+// 基础配置
 const PRICE_KEYWORD = '电价';
 const QUANTITY_KEYWORD = '电量';
+
+console.log(`\n⚙️  运行模式: ${is15Min ? '15分钟间隔 (96点输出)' : '1小时聚合 (24点输出)'}\n`);
+
+// 生成时间标签工具函数
+function generateTimeLabels(is15Min) {
+    const labels = [];
+    if (is15Min) {
+        for (let h = 0; h < 24; h++) {
+            for (let m = 0; m < 60; m += 15) {
+                labels.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+            }
+        }
+    } else {
+        for (let h = 0; h < 24; h++) {
+            labels.push(`${String(h).padStart(2, '0')}:00`);
+        }
+    }
+    return labels;
+}
 
 function processFile(filename) {
     console.log(`Processing: ${filename}`);
@@ -39,19 +65,18 @@ function processFile(filename) {
     const isPrice = filename.includes(PRICE_KEYWORD);
     const isQuantity = filename.includes(QUANTITY_KEYWORD);
     
-    // Determine aggregation method
-    // Default to average if unknown, but for 'quantity' use sum
+    // 判断聚合方式（如果是15分钟模式，此设置将不被触发）
     const useSum = isQuantity;
-    console.log(`Type: ${isPrice ? 'Price' : (isQuantity ? 'Quantity' : 'Unknown')}, Aggregation: ${useSum ? 'Sum' : 'Average'}`);
+    if (!is15Min) {
+        console.log(`Type: ${isPrice ? 'Price' : (isQuantity ? 'Quantity' : 'Unknown')}, Aggregation: ${useSum ? 'Sum' : 'Average'}`);
+    }
 
-    const hourlyData = [];
-    
-    // Iterate through rows that contain data
-    // The structure seems to be: Header, then 6 rows of data (each 4 hours)
+    const processedData = [];
     let dataRows = [];
+    
+    // 提取包含数据的6行
     for (let i = 0; i < data.length; i++) {
         const row = data[i];
-        // Check if row has time range like "00:15-04:00"
         const hasTimeRange = row.some(cell => typeof cell === 'string' && /\d{2}:\d{2}-\d{2}:\d{2}/.test(cell));
         if (hasTimeRange) {
             dataRows.push(row);
@@ -63,9 +88,8 @@ function processFile(filename) {
         return;
     }
 
-    // Process each of the 6 rows (each represents 4 hours)
+    // 处理数据行
     dataRows.forEach((row, rowIndex) => {
-        // Find where the numbers start.
         let valueStartIndex = -1;
         for (let j = 0; j < row.length; j++) {
             if (typeof row[j] === 'string' && /\d{2}:\d{2}-\d{2}:\d{2}/.test(row[j])) {
@@ -79,53 +103,66 @@ function processFile(filename) {
             return;
         }
 
+        // 取出当前4小时块内的16个数据点
         const values = row.slice(valueStartIndex, valueStartIndex + 16);
+        const numericValues = values.map(v => {
+            const num = parseFloat(v);
+            return isNaN(num) ? 0 : num; // 处理空值或非数字字符
+        });
         
-        // Process 4 chunks of 4 values (16 values total)
-        for (let h = 0; h < 4; h++) {
-            const chunk = values.slice(h * 4, (h + 1) * 4);
-            // Convert to numbers and filter valid
-            const numericChunk = chunk.map(v => parseFloat(v)).filter(v => !isNaN(v));
-            
-            if (numericChunk.length === 0) {
-                hourlyData.push(0);
-                continue;
+        if (is15Min) {
+            // 【15分钟模式】：直接推入16个原始数据
+            processedData.push(...numericValues);
+        } else {
+            // 【1小时模式】：将16个数据分成4块，每块4个数据进行聚合
+            for (let h = 0; h < 4; h++) {
+                const chunk = numericValues.slice(h * 4, (h + 1) * 4);
+                let result = 0;
+                
+                if (chunk.length > 0) {
+                    const sum = chunk.reduce((a, b) => a + b, 0);
+                    result = useSum ? sum : sum / chunk.length;
+                }
+                processedData.push(result);
             }
-
-            let result;
-            if (useSum) {
-                result = numericChunk.reduce((a, b) => a + b, 0);
-            } else {
-                // Average
-                const sum = numericChunk.reduce((a, b) => a + b, 0);
-                result = sum / numericChunk.length;
-            }
-            hourlyData.push(result);
         }
     });
 
-    // Create new workbook
+    // 创建新的Excel工作簿
+    const timeLabels = generateTimeLabels(is15Min);
     const newWb = XLSX.utils.book_new();
     const newWsData = [
-        ["Hour", "Value"]
+        ["Time", "Value"]
     ];
     
-    hourlyData.forEach((val, index) => {
-        newWsData.push([index, val]); // 0-23
+    processedData.forEach((val, index) => {
+        // 防止数据点越界导致没有时间标签
+        const label = timeLabels[index] || `Point_${index + 1}`;
+        newWsData.push([label, val]);
     });
 
+    const sheetTitle = is15Min ? "96Points" : "24Points";
     const newWs = XLSX.utils.aoa_to_sheet(newWsData);
-    XLSX.utils.book_append_sheet(newWb, newWs, "24Points");
+    XLSX.utils.book_append_sheet(newWb, newWs, sheetTitle);
     
-    const newFilename = path.parse(filename).name + "_24点.xlsx";
+    // 动态生成文件名后缀
+    const suffix = is15Min ? "_96点(15min).xlsx" : "_24点(1h).xlsx";
+    const newFilename = path.parse(filename).name + suffix;
+    
     XLSX.writeFile(newWb, newFilename);
-    console.log(`Saved: ${newFilename}`);
+    console.log(`Saved: ${newFilename}\n`);
 }
 
-const allFiles = fs.readdirSync('.').filter(f => f.endsWith('.xlsx') && !f.endsWith('_24点.xlsx') && !f.startsWith('~$'));
+// 扫描当前目录下的文件并排除已生成的文件
+const allFiles = fs.readdirSync('.').filter(f => 
+    f.endsWith('.xlsx') && 
+    !f.endsWith('_24点(1h).xlsx') && 
+    !f.endsWith('_96点(15min).xlsx') && 
+    !f.startsWith('~$')
+);
 
 if (allFiles.length === 0) {
-    console.log("No files to process found.");
+    console.log("No valid Excel files to process found in the current directory.");
 } else {
     allFiles.forEach(file => {
         try {
@@ -136,3 +173,4 @@ if (allFiles.length === 0) {
     });
 }
 ```
+
